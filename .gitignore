@@ -1,0 +1,10 @@
+1_bwa_basic.ipynb
+2_bwa_improved_prompting.ipynb
+3_bwa_research.ipynb
+4_bwa_research_fine_tuned.ipynb
+5_bwa_image.ipynb
+tavily_test.ipynb
+.venv/
+__pycache__/
+*.pyc
+.env
