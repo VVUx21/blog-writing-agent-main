@@ -17,8 +17,7 @@ import streamlit as st
 # -----------------------------
 from bwa_backend import app
 
-LLM_MODEL_NAME = "gemini-2.5-flash"
-
+LLM_MODEL_NAME = f"ollama:{os.getenv('OLLAMA_MODEL', 'qwen2.5:7b')}"
 
 # -----------------------------
 # Helpers

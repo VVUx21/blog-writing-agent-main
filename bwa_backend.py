@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import operator
 import os
 import re
@@ -12,18 +13,23 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_ollama import ChatOllama
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("bwa")
 
 # ============================================================
 # Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
 # Patches image capability using your 3-node reducer flow:
 #   merge_content -> decide_images -> generate_and_place_images
 # ============================================================
-
 
 # -----------------------------
 # 1) Schemas
@@ -113,7 +119,8 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+llm = ChatOllama(model=OLLAMA_MODEL, temperature=0.7)
 
 # -----------------------------
 # 3) Router
@@ -133,6 +140,7 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
+    logger.info("router_node: start")
     decider = llm.with_structured_output(RouterDecision)
     decision = decider.invoke(
         [
@@ -148,12 +156,20 @@ def router_node(state: State) -> dict:
     else:
         recency_days = 3650
 
-    return {
+    result = {
         "needs_research": decision.needs_research,
         "mode": decision.mode,
         "queries": decision.queries,
         "recency_days": recency_days,
     }
+    logger.info(
+        "router_node: done needs_research=%s mode=%s queries=%d recency_days=%d",
+        decision.needs_research,
+        decision.mode,
+        len(decision.queries or []),
+        recency_days,
+    )
+    return result
 
 def route_next(state: State) -> str:
     return "research" if state["needs_research"] else "orchestrator"
@@ -204,12 +220,14 @@ Rules:
 """
 
 def research_node(state: State) -> dict:
+    logger.info("research_node: start queries=%d", len(state.get("queries") or []))
     queries = (state.get("queries") or [])[:10]
     raw: List[dict] = []
     for q in queries:
         raw.extend(_tavily_search(q, max_results=6))
 
     if not raw:
+        logger.info("research_node: no raw results")
         return {"evidence": []}
 
     extractor = llm.with_structured_output(EvidencePack)
@@ -237,6 +255,7 @@ def research_node(state: State) -> dict:
         cutoff = as_of - timedelta(days=int(state["recency_days"]))
         evidence = [e for e in evidence if (d := _iso_to_date(e.published_at)) and d >= cutoff]
 
+    logger.info("research_node: done evidence=%d", len(evidence))
     return {"evidence": evidence}
 
 # -----------------------------
@@ -261,6 +280,7 @@ Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
+    logger.info("orchestrator_node: start mode=%s", state.get("mode"))
     planner = llm.with_structured_output(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
@@ -284,6 +304,7 @@ def orchestrator_node(state: State) -> dict:
     if forced_kind:
         plan.blog_kind = "news_roundup"
 
+    logger.info("orchestrator_node: done tasks=%d", len(plan.tasks))
     return {"plan": plan}
 
 
@@ -338,6 +359,13 @@ def worker_node(payload: dict) -> dict:
     plan = Plan(**payload["plan"])
     evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
 
+    logger.info(
+        "worker_node: start task_id=%s title=%s evidence=%d",
+        task.id,
+        task.title,
+        len(evidence),
+    )
+
     bullets_text = "\n- " + "\n- ".join(task.bullets)
     evidence_text = "\n".join(
         f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
@@ -371,6 +399,7 @@ def worker_node(payload: dict) -> dict:
         ]
     ).content.strip()
 
+    logger.info("worker_node: done task_id=%s chars=%d", task.id, len(section_md))
     return {"sections": [(task.id, section_md)]}
 
 # ============================================================
@@ -378,12 +407,14 @@ def worker_node(payload: dict) -> dict:
 #    merge_content -> decide_images -> generate_and_place_images
 # ============================================================
 def merge_content(state: State) -> dict:
+    logger.info("merge_content: start sections=%d", len(state.get("sections", []) or []))
     plan = state["plan"]
     if plan is None:
         raise ValueError("merge_content called without plan.")
     ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
     body = "\n\n".join(ordered_sections).strip()
     merged_md = f"# {plan.blog_title}\n\n{body}\n"
+    logger.info("merge_content: done chars=%d", len(merged_md))
     return {"merged_md": merged_md}
 
 
@@ -400,29 +431,37 @@ Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
-    planner = llm.with_structured_output(GlobalImagePlan)
-    merged_md = state["merged_md"]
-    plan = state["plan"]
-    assert plan is not None
+    logger.info("decide_images: start")
+    try:
+        planner = llm.with_structured_output(GlobalImagePlan)
+        merged_md = state["merged_md"]
+        plan = state["plan"]
+        assert plan is not None
 
-    image_plan = planner.invoke(
-        [
-            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Topic: {state['topic']}\n\n"
-                    "Insert placeholders + propose image prompts.\n\n"
-                    f"{merged_md}"
-                )
-            ),
-        ]
-    )
+        image_plan = planner.invoke(
+            [
+                SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Blog kind: {plan.blog_kind}\n"
+                        f"Topic: {state['topic']}\n\n"
+                        "Insert placeholders + propose image prompts.\n\n"
+                        f"{merged_md}"
+                    )
+                ),
+            ]
+        )
 
-    return {
-        "md_with_placeholders": image_plan.md_with_placeholders,
-        "image_specs": [img.model_dump() for img in image_plan.images],
-    }
+        result = {
+            "md_with_placeholders": image_plan.md_with_placeholders,
+            "image_specs": [img.model_dump() for img in image_plan.images],
+        }
+        logger.info("decide_images: done images=%d", len(image_plan.images))
+        return result
+    except Exception:
+        merged_md = state.get("merged_md", "")
+        logger.exception("decide_images: failed, continuing without images")
+        return {"md_with_placeholders": merged_md, "image_specs": []}
 
 
 def _gemini_generate_image_bytes(prompt: str) -> bytes:
@@ -481,48 +520,68 @@ def _safe_slug(title: str) -> str:
 
 
 def generate_and_place_images(state: State) -> dict:
-    plan = state["plan"]
-    assert plan is not None
+    logger.info("generate_and_place_images: start")
+    try:
+        plan = state["plan"]
+        assert plan is not None
 
-    md = state.get("md_with_placeholders") or state["merged_md"]
-    image_specs = state.get("image_specs", []) or []
+        md = state.get("md_with_placeholders") or state["merged_md"]
+        image_specs = state.get("image_specs", []) or []
 
-    # If no images requested, just write merged markdown
-    if not image_specs:
+        # If no images requested, just write merged markdown
+        if not image_specs:
+            logger.info("generate_and_place_images: no images requested")
+            filename = f"{_safe_slug(plan.blog_title)}.md"
+            Path(filename).write_text(md, encoding="utf-8")
+            return {"final": md}
+
+        images_dir = Path("images")
+        images_dir.mkdir(exist_ok=True)
+
+        for spec in image_specs:
+            placeholder = spec["placeholder"]
+            filename = spec["filename"]
+            out_path = images_dir / filename
+
+            # generate only if needed
+            if not out_path.exists():
+                try:
+                    img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+                    out_path.write_bytes(img_bytes)
+                    logger.info("generate_and_place_images: wrote %s", out_path.name)
+                except Exception as e:
+                    # graceful fallback: keep doc usable
+                    prompt_block = (
+                        f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
+                        f"> **Alt:** {spec.get('alt','')}\n>\n"
+                        f"> **Prompt:** {spec.get('prompt','')}\n>\n"
+                        f"> **Error:** {e}\n"
+                    )
+                    md = md.replace(placeholder, prompt_block)
+                    logger.exception(
+                        "generate_and_place_images: failed for %s",
+                        spec.get("filename"),
+                    )
+                    continue
+
+            img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
+            md = md.replace(placeholder, img_md)
+
         filename = f"{_safe_slug(plan.blog_title)}.md"
         Path(filename).write_text(md, encoding="utf-8")
+        logger.info("generate_and_place_images: done")
         return {"final": md}
-
-    images_dir = Path("images")
-    images_dir.mkdir(exist_ok=True)
-
-    for spec in image_specs:
-        placeholder = spec["placeholder"]
-        filename = spec["filename"]
-        out_path = images_dir / filename
-
-        # generate only if needed
-        if not out_path.exists():
-            try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
-                out_path.write_bytes(img_bytes)
-            except Exception as e:
-                # graceful fallback: keep doc usable
-                prompt_block = (
-                    f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
-                    f"> **Alt:** {spec.get('alt','')}\n>\n"
-                    f"> **Prompt:** {spec.get('prompt','')}\n>\n"
-                    f"> **Error:** {e}\n"
-                )
-                md = md.replace(placeholder, prompt_block)
-                continue
-
-        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
-        md = md.replace(placeholder, img_md)
-
-    filename = f"{_safe_slug(plan.blog_title)}.md"
-    Path(filename).write_text(md, encoding="utf-8")
-    return {"final": md}
+    except Exception:
+        logger.exception("generate_and_place_images: failed, returning markdown")
+        md = state.get("md_with_placeholders") or state.get("merged_md", "")
+        try:
+            plan = state.get("plan")
+            if plan is not None:
+                filename = f"{_safe_slug(plan.blog_title)}.md"
+                Path(filename).write_text(md, encoding="utf-8")
+        except Exception:
+            pass
+        return {"final": md}
 
 # build reducer subgraph
 reducer_graph = StateGraph(State)

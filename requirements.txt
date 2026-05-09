@@ -5,6 +5,8 @@ python-dotenv
 langgraph
 langchain-core
 langchain-community
+langchain-ollama
 langchain-google-genai
 google-genai
+ollama
 tavily-python
