@@ -17,7 +17,8 @@ import streamlit as st
 # -----------------------------
 from bwa_backend import app
 
-LLM_MODEL_NAME = f"ollama:{os.getenv('OLLAMA_MODEL', 'qwen2.5:7b')}"
+LLM_MODEL_NAME = f"openai:{os.getenv('OPENAI_MODEL', 'gpt-4o-mini')}"
+IMAGE_MODEL_NAME = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 
 # -----------------------------
 # Helpers
@@ -186,6 +187,25 @@ def extract_title_from_md(md: str, fallback: str) -> str:
     return fallback
 
 
+def metadata_path_for_md(md_path: Path) -> Path:
+    return md_path.with_suffix(".json")
+
+
+def write_metadata(md_path: Path, payload: Dict[str, Any]) -> None:
+    meta_path = metadata_path_for_md(md_path)
+    meta_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def read_metadata(md_path: Path) -> Optional[Dict[str, Any]]:
+    meta_path = metadata_path_for_md(md_path)
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -196,6 +216,7 @@ st.title("Blog Writing Agent")
 with st.sidebar:
     st.header("Generate New Blog")
     st.caption(f"Model: {LLM_MODEL_NAME}")
+    st.caption(f"Images: {IMAGE_MODEL_NAME}")
     topic = st.text_area(
         "Topic",
         height=120,
@@ -221,7 +242,7 @@ with st.sidebar:
                 title = extract_title_from_md(md_text, p.stem)
             except Exception:
                 title = p.stem
-            label = f"{title}  ·  {p.name}"
+            label = f"{title}"
             options.append(label)
             file_by_label[label] = p
 
@@ -236,13 +257,16 @@ with st.sidebar:
         if st.button("📂 Load selected blog"):
             if selected_md_file:
                 md_text = read_md_file(selected_md_file)
+                meta = read_metadata(selected_md_file) or {}
                 # Load into session_state as if it were a run output
                 st.session_state["last_out"] = {
-                    "plan": None,          # old files don't include plan
-                    "evidence": [],        # old files don't include evidence
-                    "image_specs": [],     # optional (not persisted)
-                    "final": md_text,      # markdown body
+                    "plan": meta.get("plan"),
+                    "evidence": meta.get("evidence", []),
+                    "image_specs": meta.get("image_specs", []),
+                    "final": md_text,
                 }
+                if meta.get("logs"):
+                    st.session_state["logs"] = meta.get("logs")
                 # also update the topic input to the title (best-effort) without changing UI
                 st.session_state["topic_prefill"] = extract_title_from_md(md_text, selected_md_file.stem)
 
@@ -325,6 +349,31 @@ if run_btn:
             st.session_state["last_out"] = out
             status.update(label="✅ Done", state="complete", expanded=False)
             log("[final] received final state")
+
+            final_md = out.get("final") or ""
+            plan_obj = out.get("plan")
+            if hasattr(plan_obj, "blog_title"):
+                blog_title = plan_obj.blog_title
+            elif isinstance(plan_obj, dict):
+                blog_title = plan_obj.get("blog_title", "blog")
+            else:
+                blog_title = extract_title_from_md(final_md, "blog")
+
+            md_filename = f"{safe_slug(blog_title)}.md"
+            md_path = Path(md_filename)
+
+            logs_payload = st.session_state.get("logs", [])
+            if logs:
+                logs_payload = logs_payload + logs
+            write_metadata(
+                md_path,
+                {
+                    "plan": out.get("plan"),
+                    "evidence": out.get("evidence", []),
+                    "image_specs": out.get("image_specs", []),
+                    "logs": logs_payload,
+                },
+            )
 
 # Render last result (if any)
 out = st.session_state.get("last_out")
